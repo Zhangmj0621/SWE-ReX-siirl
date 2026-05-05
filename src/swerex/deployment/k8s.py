@@ -129,6 +129,84 @@ class K8sDeployment(AbstractDeployment):
     def from_config(cls, config: K8sDeploymentConfig) -> Self:
         return cls(**config.model_dump())
 
+    @classmethod
+    async def from_existing_pod(
+        cls,
+        *,
+        pod_name: str,
+        namespace: str,
+        auth_token: str,
+        pod_ip: str | None = None,
+        startup_timeout: float = 60.0,
+        runtime_timeout: float = 1800.0,
+        **kwargs: Any,
+    ) -> Self:
+        """Attach to an already-running pod without creating a new one.
+
+        Used by siirl's SWE partial-rollout path: when a rollout is aborted
+        mid-step (e.g. by param_sync's abort_generation), the env is
+        preserved — the pod keeps running and only the Python-side runtime
+        client is closed. The worker that picks the sample back up calls
+        this to reconnect to the same pod so accumulated filesystem state
+        (applied patches, shell artefacts) survives the abort/resume.
+
+        Args:
+            pod_name: existing pod name (as produced by ``_get_pod_name``).
+            namespace: k8s namespace the pod lives in.
+            auth_token: the ``--auth-token`` uuid that the swerex server
+                inside the pod was started with. The original worker must
+                have captured this before detach; parsing it back out of
+                the pod spec is possible but adds latency.
+            pod_ip: optional — if None, we fetch it via ``kubectl get pod``.
+            startup_timeout: how long to wait for the runtime to respond
+                before giving up.
+            runtime_timeout: per-request timeout for the runtime client.
+            **kwargs: passed through to ``K8sDeploymentConfig`` (image,
+                namespace are harmless to provide even though unused here).
+        """
+        self = cls(
+            namespace=namespace,
+            runtime_timeout=runtime_timeout,
+            **kwargs,
+        )
+        self._pod_name = pod_name
+        self._token = auth_token
+
+        if pod_ip is None:
+            returncode, stdout, stderr = await _async_kubectl(
+                "get", "pod", pod_name, f"--namespace={namespace}", "-o", "json",
+                timeout=30,
+            )
+            if returncode != 0:
+                msg = (
+                    f"from_existing_pod: pod {pod_name!r} not found in namespace "
+                    f"{namespace!r}: {stderr!r}"
+                )
+                raise RuntimeError(msg)
+            pod_json = json.loads(stdout)
+            pod_ip = pod_json.get("status", {}).get("podIP")
+            if not pod_ip:
+                msg = f"from_existing_pod: pod {pod_name!r} has no status.podIP yet"
+                raise RuntimeError(msg)
+        self._pod_ip = pod_ip
+
+        self._runtime = RemoteRuntime.from_config(
+            RemoteRuntimeConfig(
+                host=f"http://{pod_ip}",
+                port=8000,
+                timeout=self._runtime_timeout,
+                auth_token=self._token,
+                upload_num_retries=self._config.upload_num_retries,
+                upload_retry_delay=self._config.upload_retry_delay,
+                upload_backoff_max=self._config.upload_backoff_max,
+            )
+        )
+
+        # Confirm the swerex HTTP server in the pod still responds before
+        # handing the deployment back to the caller.
+        await self._wait_until_alive(timeout=startup_timeout)
+        return self
+
     def _get_pod_name(self) -> str:
         """Returns a concise, DNS-1123 compliant pod name.
 
